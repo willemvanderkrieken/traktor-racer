@@ -17,7 +17,7 @@ const STATS_FILE= path.join(DATA_DIR, 'stats.json');
 const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
 const GAME_FILE = path.join(__dirname, 'traktor-racer.html');
 
-const MAX_SCORES = 50;   // how many we keep on disk (top 20 shown to players)
+const MAX_SCORES = 500;  // how many we keep on disk (so a player's rank + neighbours stay meaningful)
 
 let stats = { plays:0, bestDistance:0, longestConvoy:0, totalTractors:0, updated:null };
 let scores = [];         // [{name, distance, trekkers, ts}]  sorted high->low by distance
@@ -95,7 +95,13 @@ const server = http.createServer((req,res)=>{
         if(scores.length > MAX_SCORES) scores.length = MAX_SCORES;
         scoresDirty = true;
         const rank = scores.indexOf(entry) + 1;   // 1-based; 0 if it fell off the list
-        return send(res,200,'application/json', JSON.stringify({ rank, top: scores.slice(0,20) }));
+        const top = scores.slice(0, 10);          // always the overall top 10
+        let around = [], aroundFrom = 0;          // a window of 10 above + you + 10 below
+        if(rank > 0){
+          const from = Math.max(0, rank-11), to = Math.min(scores.length, rank+10);
+          around = scores.slice(from, to); aroundFrom = from + 1;
+        }
+        return send(res,200,'application/json', JSON.stringify({ rank, total: scores.length, top, around, aroundFrom }));
       } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'})); }
     });
     return;

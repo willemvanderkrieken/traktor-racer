@@ -92,6 +92,8 @@
   .hsRow .ds { font-weight:900; color:#e65100; min-width:66px; text-align:right; }
   .hsRow .tk { color:#6b7d6e; font-weight:800; font-size:13px; min-width:52px; text-align:right; }
   .hsRow.me { background:#fff6d6; border-radius:8px; }
+  .hsGap { text-align:center; color:#b0bbae; font-weight:900; letter-spacing:3px; padding:3px 0; }
+  .hsSub { color:#6b7d6e; font-weight:800; font-size:12px; margin:10px 0 2px; text-transform:uppercase; letter-spacing:.5px; }
   #challenge { background:#fff6d6; border:2px solid #ffcf33; border-radius:10px; padding:9px 12px; margin:0 0 10px; font-weight:800; color:#8a6d00; }
 
   /* on-screen driving pads (left / right of the screen) */
@@ -940,15 +942,23 @@ async function shareResult(){
   }
   window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');   // fallback: WhatsApp text link
 }
-function renderLeaderboard(top, myRank){
+function hsRowHTML(rk, r, me){
+  return '<div class="hsRow'+(me?' me':'')+'"><span class="rk">'+rk+'</span><span class="nm">'+esc(r.name)+
+         '</span><span class="ds">'+r.distance+' m</span><span class="tk">'+(r.trekkers||0)+' 🚜</span></div>';
+}
+function renderLeaderboard(d){
+  const top=d.top||[], around=d.around||[], aroundFrom=d.aroundFrom||0, rank=d.rank||0;
   let h = '<div class="hsTitle">🏆 Highscores — verste afstand</div>';
-  (top||[]).forEach((r,i)=>{
-    const me = (i+1)===myRank ? ' me' : '';
-    h += '<div class="hsRow'+me+'"><span class="rk">'+(i+1)+'</span><span class="nm">'+esc(r.name)+'</span><span class="ds">'+r.distance+' m</span><span class="tk">'+(r.trekkers||0)+' 🚜</span></div>';
-  });
-  if(myRank>20){
+  h += '<div class="hsSub">Top 10</div>';
+  top.forEach((r,i)=> h += hsRowHTML(i+1, r, (i+1)===rank));
+  if(rank>10 && around.length){                     // your neighbourhood: 10 above + you + 10 below
+    h += '<div class="hsSub">Jouw plek</div>';
+    if(Math.max(aroundFrom,11) > 11) h += '<div class="hsGap">⋯</div>';
+    around.forEach((r,k)=>{ const rk=aroundFrom+k; if(rk>10) h += hsRowHTML(rk, r, rk===rank); });
+  } else if(rank<=0){                                // fell outside the stored list
     const nm = (document.getElementById('hsName').value||'Jij').trim() || 'Jij';
-    h += '<div class="hsRow me"><span class="rk">'+myRank+'</span><span class="nm">'+esc(nm)+'</span><span class="ds">'+lastDist+' m</span><span class="tk">'+lastTrek+' 🚜</span></div>';
+    h += '<div class="hsSub">Jouw plek</div><div class="hsGap">⋯</div>' +
+         hsRowHTML('–', {name:nm, distance:lastDist, trekkers:lastTrek}, true);
   }
   const el=document.getElementById('hsList'); el.innerHTML=h; el.style.display='block';
   document.getElementById('hsEntry').style.display='none';
@@ -958,7 +968,7 @@ function submitScore(){
   const body = JSON.stringify({ name, distance:lastDist, trekkers:lastTrek });
   fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body})
     .then(r=>{ if(!r.ok) throw 0; return r.json(); })
-    .then(d=>renderLeaderboard(d.top, d.rank))
+    .then(d=>renderLeaderboard(d))
     .catch(()=>{                                   // no server reachable (e.g. opened as a local file)
       const el=document.getElementById('hsList');
       el.innerHTML = '<div class="hsTitle">🏆 Highscores</div>'+
