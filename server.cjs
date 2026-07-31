@@ -14,21 +14,35 @@ const PORT      = process.env.PORT || 3000;
 const KEY       = process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2';   // override via env in production
 const DATA_DIR  = process.env.DATA_DIR || '/data';
 const STATS_FILE= path.join(DATA_DIR, 'stats.json');
+const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
 const GAME_FILE = path.join(__dirname, 'traktor-racer.html');
 
+const MAX_SCORES = 50;   // how many we keep on disk (top 20 shown to players)
+
 let stats = { plays:0, bestDistance:0, longestConvoy:0, totalTractors:0, updated:null };
+let scores = [];         // [{name, distance, trekkers, ts}]  sorted high->low by distance
 try { fs.mkdirSync(DATA_DIR, { recursive:true }); } catch(e){}
 try { Object.assign(stats, JSON.parse(fs.readFileSync(STATS_FILE,'utf8'))); } catch(e){}
+try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArray(s)) scores = s; } catch(e){}
+
+function cleanName(v){
+  return String(v==null?'':v).replace(/[\x00-\x1f\x7f]+/g,' ').replace(/\s+/g,' ').trim().slice(0,24) || 'Anoniem';
+}
 
 let game = '<h1>Game bestand ontbreekt</h1>';
 try { game = fs.readFileSync(GAME_FILE,'utf8'); } catch(e){}
 
 // buffered + atomic persistence (tmp file then rename) so nothing corrupts under load
-let dirty = false;
+let dirty = false, scoresDirty = false;
 function persist(){
-  if(!dirty) return; dirty = false;
-  try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
-  catch(e){ dirty = true; }
+  if(dirty){ dirty = false;
+    try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
+    catch(e){ dirty = true; }
+  }
+  if(scoresDirty){ scoresDirty = false;
+    try { const tmp = SCORES_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(scores)); fs.renameSync(tmp, SCORES_FILE); }
+    catch(e){ scoresDirty = true; }
+  }
 }
 setInterval(persist, 2000);
 process.on('SIGTERM', ()=>{ persist(); process.exit(0); });
@@ -62,6 +76,34 @@ const server = http.createServer((req,res)=>{
       send(res,204,'text/plain','');
     });
     return;
+  }
+
+  // submit a highscore (name only) — returns the top list + the player's rank
+  if(req.method==='POST' && u.pathname==='/api/score'){
+    let b=''; let abort=false;
+    req.on('data', c=>{ b+=c; if(b.length>3000){ abort=true; req.destroy(); } });
+    req.on('end', ()=>{
+      if(abort) return;
+      try{
+        const d = JSON.parse(b || '{}');
+        const name = cleanName(d.name);
+        const dist = Math.max(0, Math.min(1e7, Math.floor(Number(d.distance)||0)));
+        const trek = Math.max(0, Math.min(1e6, Math.floor(Number(d.trekkers)||0)));
+        const entry = { name, distance:dist, trekkers:trek, ts:Date.now() };
+        scores.push(entry);
+        scores.sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
+        if(scores.length > MAX_SCORES) scores.length = MAX_SCORES;
+        scoresDirty = true;
+        const rank = scores.indexOf(entry) + 1;   // 1-based; 0 if it fell off the list
+        return send(res,200,'application/json', JSON.stringify({ rank, top: scores.slice(0,20) }));
+      } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'})); }
+    });
+    return;
+  }
+
+  // public leaderboard (top 20)
+  if(u.pathname==='/api/scores'){
+    return send(res,200,'application/json', JSON.stringify({ top: scores.slice(0,20) }));
   }
 
   // private stats (owner only)
