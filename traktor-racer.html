@@ -460,6 +460,12 @@ function endGame(win, title){
   document.getElementById('pads').style.display='none';
   const dist = Math.max(0, Math.floor((tr.cx-150)/10));
   best.stunt = Math.max(best.stunt, dist);
+  // report the finished run to the stats backend (fire-and-forget; silently ignored when played offline)
+  try {
+    const body = JSON.stringify({ distance: dist, convoy: convoyTotal });
+    if (navigator.sendBeacon) navigator.sendBeacon('/api/result', new Blob([body], {type:'application/json'}));
+    else fetch('/api/result', {method:'POST', headers:{'Content-Type':'application/json'}, body, keepalive:true}).catch(()=>{});
+  } catch(e){}
   document.getElementById('endTitle').textContent = '💥 '+title;
   document.getElementById('endText').innerHTML =
     `<div class="stat hero"><span class="lbl">Score</span><span class="num">${score}</span></div>`+

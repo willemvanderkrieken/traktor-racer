@@ -1,7 +1,14 @@
 services:
   traktor:
-    build: .                 # bouwt de nginx-image uit de Dockerfile in deze map
+    build: .                 # bouwt de Node-image uit de Dockerfile in deze map
     image: traktor-racer
     restart: unless-stopped
-    ports:
-      - "80"                 # Coolify koppelt hier automatisch je domein + HTTPS aan
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+      - STATS_KEY=${STATS_KEY:-changeme}   # zet in Coolify een eigen geheime sleutel
+    volumes:
+      - traktor-stats:/data  # bewaart de statistieken tussen deploys
+
+volumes:
+  traktor-stats:
