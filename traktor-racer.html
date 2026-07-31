@@ -240,6 +240,8 @@ function rot(x,y,a){ const c=Math.cos(a), s=Math.sin(a); return {x:x*c-y*s, y:x*
 let throttle = 0; // -1..1  (+1 gas forward, -1 brake/reverse)
 const keys = {};
 window.addEventListener('keydown', e=>{
+  // don't hijack keys while typing in a text field (e.g. the highscore name — 'a' is also a steering key)
+  const t=e.target; if(t && (t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
   if(['ArrowRight','ArrowLeft','ArrowUp','ArrowDown','KeyA','KeyD',' '].includes(e.key)||['ArrowRight','ArrowLeft','KeyA','KeyD'].includes(e.code)) e.preventDefault();
   keys[e.code]=true;
 });
@@ -898,14 +900,45 @@ document.getElementById('againBtn').addEventListener('click', startGame);
 
 // ---------- Highscore (name only) + WhatsApp share + challenge link ----------
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-const GAME_URL = location.origin + location.pathname;
 function challengeURL(){
   const nm = (document.getElementById('hsName').value||'').trim().slice(0,24);
-  return GAME_URL + '?van=' + encodeURIComponent(nm||'Iemand') + '&score=' + lastDist;
+  return location.origin + '/u/' + encodeURIComponent(nm||'Iemand') + '/' + lastDist;   // clean path-style link
 }
-function shareWhatsApp(){
-  const txt = 'Ik reed ' + lastDist + ' m in T.O.T.-rit Boekel! 🚜 Kun jij verder komen? ' + challengeURL();
-  window.open('https://wa.me/?text=' + encodeURIComponent(txt), '_blank');
+// build a shareable card: the player's final game frame + a score banner
+function buildShareCard(){
+  const cw=1080, ch=1080, bh=210;
+  const c=document.createElement('canvas'); c.width=cw; c.height=ch;
+  const g=c.getContext('2d');
+  g.fillStyle='#7ec8ff'; g.fillRect(0,0,cw,ch);
+  try{
+    const sw=canvas.width, sh=canvas.height, th=ch-bh;
+    const scale=Math.max(cw/sw, th/sh), dw=sw*scale, dh=sh*scale;
+    g.drawImage(canvas, (cw-dw)/2, (th-dh)/2, dw, dh);     // cover-fit the game screenshot
+  }catch(e){}
+  g.fillStyle='rgba(18,38,58,0.86)'; g.fillRect(0, ch-bh, cw, bh);
+  g.textAlign='center';
+  g.fillStyle='#ffcf33'; g.font='900 92px system-ui,-apple-system,sans-serif';
+  g.fillText(lastDist+' m', cw/2, ch-96);
+  g.fillStyle='#fff'; g.font='700 38px system-ui,-apple-system,sans-serif';
+  g.fillText('T.O.T.-rit Boekel  ·  '+lastTrek+' 🚜  ·  totrit.inboekel.nl', cw/2, ch-42);
+  return c;
+}
+async function shareResult(){
+  const url = challengeURL();
+  const text = '🚜 Doe mee met de T.O.T.-rit in Boekel! Ik reed ' + lastDist + ' m — kom jij verder? Speel gratis mee: ' + url;
+  let file=null, canFiles=false;
+  try{
+    if(navigator.canShare){
+      const blob = await new Promise(r=>buildShareCard().toBlob(r,'image/png'));
+      if(blob){ file=new File([blob],'tot-rit-boekel.png',{type:'image/png'}); canFiles=navigator.canShare({files:[file]}); }
+    }
+  }catch(e){ canFiles=false; }
+  if(canFiles){
+    try{ await navigator.share({ files:[file], text }); }   // mobile: native sheet incl. WhatsApp, with the image
+    catch(e){ /* user cancelled the share sheet — do nothing */ }
+    return;
+  }
+  window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');   // fallback: WhatsApp text link
 }
 function renderLeaderboard(top, myRank){
   let h = '<div class="hsTitle">🏆 Highscores — verste afstand</div>';
@@ -935,12 +968,14 @@ function submitScore(){
 }
 document.getElementById('hsSubmit').addEventListener('click', submitScore);
 document.getElementById('hsName').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitScore(); } });
-document.getElementById('shareBtn').addEventListener('click', shareWhatsApp);
+document.getElementById('shareBtn').addEventListener('click', shareResult);
 
 // show a challenge banner on the start screen when opened via a shared link
 (function(){
-  const p=new URLSearchParams(location.search);
-  const van=p.get('van'), sc=parseInt(p.get('score')||'',10);
+  let van=null, sc=NaN;
+  const m = location.pathname.match(/^\/u\/([^\/]+)\/(\d+)/);   // clean path form: /u/Naam/1240
+  if(m){ try{ van=decodeURIComponent(m[1]); }catch(e){ van=m[1]; } sc=parseInt(m[2],10); }
+  else { const p=new URLSearchParams(location.search); van=p.get('van'); sc=parseInt(p.get('score')||'',10); }  // legacy ?van=&score=
   if(van && sc>0){
     const el=document.getElementById('challenge');
     el.textContent = '🚜 ' + van + ' daagt je uit: kom verder dan ' + sc + ' m!';

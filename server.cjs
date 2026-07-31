@@ -130,7 +130,8 @@ small{color:#8a9a8c}</style>
   }
 
   if(u.pathname==='/healthz') return send(res,200,'text/plain','ok');
-  if(u.pathname==='/' || u.pathname==='/index.html') return send(res,200,'text/html; charset=utf-8', game);
+  // serve the game for the homepage and for clean challenge links like /u/Naam/1240
+  if(req.method==='GET') return send(res,200,'text/html; charset=utf-8', game);
   return send(res,404,'text/plain','Not found');
 });
 
