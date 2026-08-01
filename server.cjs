@@ -28,12 +28,16 @@ try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArra
 function cleanName(v){
   return String(v==null?'':v).replace(/[\x00-\x1f\x7f]+/g,' ').replace(/\s+/g,' ').trim().slice(0,24) || 'Anoniem';
 }
+// a score is only shown on the leaderboard if it has a real name (anonymous ones are hidden)
+function isNamed(s){ const n=((s&&s.name)||'').trim().toLowerCase(); return !!n && n!=='anoniem'; }
 
 let game = '<h1>Game bestand ontbreekt</h1>';
 try { game = fs.readFileSync(GAME_FILE,'utf8'); } catch(e){}
 
 // buffered + atomic persistence (tmp file then rename) so nothing corrupts under load
 let dirty = false, scoresDirty = false;
+// one-time data fix: give the record-holder a proper name (idempotent — only matches while still 'Anoniem')
+{ const rec = scores.find(s=> s.ts===1785566034117); if(rec && rec.name==='Anoniem'){ rec.name='Sanne van den Elzen'; scoresDirty=true; } }
 function persist(){
   if(dirty){ dirty = false;
     try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
@@ -94,14 +98,15 @@ const server = http.createServer((req,res)=>{
         scores.sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
         if(scores.length > MAX_SCORES) scores.length = MAX_SCORES;
         scoresDirty = true;
-        const rank = scores.indexOf(entry) + 1;   // 1-based; 0 if it fell off the list
-        const top = scores.slice(0, 10);          // always the overall top 10
-        let around = [], aroundFrom = 0;          // a window of 10 above + you + 10 below
-        if(rank > 0){
-          const from = Math.max(0, rank-11), to = Math.min(scores.length, rank+10);
-          around = scores.slice(from, to); aroundFrom = from + 1;
+        const named = scores.filter(isNamed);     // anonymous scores are never shown
+        const top = named.slice(0, 10);           // top 10 of the named leaderboard
+        let rank = 0, around = [], aroundFrom = 0; // a window of 10 above + you + 10 below
+        if(isNamed(entry)){
+          rank = named.indexOf(entry) + 1;
+          const from = Math.max(0, rank-11), to = Math.min(named.length, rank+10);
+          around = named.slice(from, to); aroundFrom = from + 1;
         }
-        return send(res,200,'application/json', JSON.stringify({ rank, total: scores.length, top, around, aroundFrom }));
+        return send(res,200,'application/json', JSON.stringify({ rank, total: named.length, top, around, aroundFrom }));
       } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'})); }
     });
     return;
@@ -109,7 +114,7 @@ const server = http.createServer((req,res)=>{
 
   // public leaderboard (top 20)
   if(u.pathname==='/api/scores'){
-    return send(res,200,'application/json', JSON.stringify({ top: scores.slice(0,20) }));
+    return send(res,200,'application/json', JSON.stringify({ top: scores.filter(isNamed).slice(0,20) }));
   }
 
   // private stats (owner only)
