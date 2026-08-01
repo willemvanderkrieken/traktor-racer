@@ -12,6 +12,8 @@ const path = require('path');
 
 const PORT      = process.env.PORT || 3000;
 const KEY       = process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2';   // override via env in production
+const ADMIN_USER= process.env.ADMIN_USER || 'boekel';                 // admin login for deleting scores
+const ADMIN_PASS= process.env.ADMIN_PASS || 'trekker-'+ (process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2');  // override via env!
 const DATA_DIR  = process.env.DATA_DIR || '/data';
 const STATS_FILE= path.join(DATA_DIR, 'stats.json');
 const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
@@ -38,6 +40,8 @@ try { game = fs.readFileSync(GAME_FILE,'utf8'); } catch(e){}
 let dirty = false, scoresDirty = false;
 // one-time data fix: give the record-holder a proper name (idempotent — only matches while still 'Anoniem')
 { const rec = scores.find(s=> s.ts===1785566034117); if(rec && rec.name==='Anoniem'){ rec.name='Sanne van den Elzen'; scoresDirty=true; } }
+// one-time cleanup: remove the fake #1 record (ZZ-TEST-CLAUDE, 999999 m) — idempotent
+{ const i = scores.findIndex(s=> s.ts===1785580257558); if(i>=0){ scores.splice(i,1); scoresDirty=true; } }
 function persist(){
   if(dirty){ dirty = false;
     try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
@@ -110,6 +114,31 @@ const server = http.createServer((req,res)=>{
       } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'})); }
     });
     return;
+  }
+
+  // admin: delete a score, by leaderboard rank (delete-score=1) or by exact id (delete-ts=...).
+  // requires user + password. Example: /admin/delete?delete-score=1&user=boekel&password=...
+  if(u.pathname==='/admin/delete' || u.searchParams.has('delete-score') || u.searchParams.has('delete-ts')){
+    const user = u.searchParams.get('user') || '';
+    const pass = u.searchParams.get('password') || '';
+    if(user !== ADMIN_USER || pass !== ADMIN_PASS){
+      return send(res,403,'application/json', JSON.stringify({error:'forbidden'}));
+    }
+    // work on the sorted, named leaderboard (same view the public sees)
+    const named = scores.filter(isNamed).slice().sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
+    let removed = null;
+    const tsParam = u.searchParams.get('delete-ts');
+    if(tsParam){
+      const ts = Number(tsParam);
+      const i = scores.findIndex(s=> s.ts===ts);
+      if(i>=0){ removed = scores.splice(i,1)[0]; scoresDirty = true; }
+    } else {
+      const rank = Math.floor(Number(u.searchParams.get('delete-score')) || 0);
+      const target = named[rank-1];
+      if(target){ const i = scores.findIndex(s=> s.ts===target.ts); if(i>=0){ removed = scores.splice(i,1)[0]; scoresDirty = true; } }
+    }
+    const top = scores.filter(isNamed).slice().sort((a,b)=> b.distance-a.distance || a.ts-b.ts).slice(0,20);
+    return send(res,200,'application/json', JSON.stringify({ ok: !!removed, removed, top }));
   }
 
   // public leaderboard (top 20)
