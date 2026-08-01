@@ -9,11 +9,20 @@
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT      = process.env.PORT || 3000;
 const KEY       = process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2';   // override via env in production
 const ADMIN_USER= process.env.ADMIN_USER || 'boekel';                 // admin login for deleting scores
 const ADMIN_PASS= process.env.ADMIN_PASS || 'trekker-'+ (process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2');  // override via env!
+// --- anti-cheat: score submissions must carry a fresh, single-use, signed start-token + a client signature ---
+const SIGN_SECRET   = process.env.SIGN_SECRET   || 'tot-sign-' + (process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2'); // signs start-tokens (server only)
+const CLIENT_SECRET = process.env.CLIENT_SECRET || 'frikandel-mayo-7Kq2Zx91';   // shared with the game client (must match the JS)
+const TOKEN_TTL_MS  = 60*60*1000;   // a start-token is valid for 60 minutes
+const MAX_MPS       = 150;          // generous max metres/second (real runs are far slower) -> minimum plausible run time
+const usedNonces    = new Map();    // nonce -> time used, so a token can't be replayed
+function hmac(secret, msg){ return crypto.createHmac('sha256', secret).update(msg).digest('hex'); }
+function eqHex(a, b){ a=String(a||''); b=String(b||''); if(a.length!==b.length || !a) return false; try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch(e){ return false; } }
 const DATA_DIR  = process.env.DATA_DIR || '/data';
 const STATS_FILE= path.join(DATA_DIR, 'stats.json');
 const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
@@ -43,6 +52,9 @@ let dirty = false, scoresDirty = false;
 // one-time cleanup: remove the fake #1 record (ZZ-TEST-CLAUDE, 999999 m) — idempotent
 { const i = scores.findIndex(s=> s.ts===1785580257558); if(i>=0){ scores.splice(i,1); scoresDirty=true; } }
 function persist(){
+  // drop expired nonces so the used-token set stays small
+  const cutoff = Date.now() - TOKEN_TTL_MS;
+  for(const [n,ts] of usedNonces){ if(ts < cutoff) usedNonces.delete(n); }
   if(dirty){ dirty = false;
     try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
     catch(e){ dirty = true; }
@@ -86,6 +98,12 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
+  // hand out a fresh, signed start-token when a run begins (used to validate the score later)
+  if(u.pathname==='/api/score-token'){
+    const t = Date.now(), n = crypto.randomBytes(9).toString('hex');
+    return send(res,200,'application/json', JSON.stringify({ t, n, sig: hmac(SIGN_SECRET, t+'.'+n) }));
+  }
+
   // submit a highscore (name only) — returns the top list + the player's rank
   if(req.method==='POST' && u.pathname==='/api/score'){
     let b=''; let abort=false;
@@ -97,6 +115,15 @@ const server = http.createServer((req,res)=>{
         const name = cleanName(d.name);
         const dist = Math.max(0, Math.min(1e7, Math.floor(Number(d.distance)||0)));
         const trek = Math.max(0, Math.min(1e6, Math.floor(Number(d.trekkers)||0)));
+        // --- anti-cheat validation: authentic single-use token + client signature + plausible run time ---
+        const t = Math.floor(Number(d.t)||0), n = String(d.n||''), sig = String(d.sig||''), csig = String(d.csig||'');
+        const now = Date.now();
+        if(!eqHex(sig, hmac(SIGN_SECRET, t+'.'+n)))                                  return send(res,403,'application/json', JSON.stringify({error:'bad-token'}));
+        if(now - t > TOKEN_TTL_MS || t - now > 60000)                               return send(res,403,'application/json', JSON.stringify({error:'expired'}));
+        if(usedNonces.has(n))                                                        return send(res,403,'application/json', JSON.stringify({error:'replay'}));
+        if(!eqHex(csig, hmac(CLIENT_SECRET, dist+'.'+trek+'.'+t+'.'+n)))             return send(res,403,'application/json', JSON.stringify({error:'bad-sig'}));
+        if((now - t) < (dist / MAX_MPS) * 1000)                                      return send(res,403,'application/json', JSON.stringify({error:'too-fast'}));
+        usedNonces.set(n, now);
         const entry = { name, distance:dist, trekkers:trek, ts:Date.now() };
         scores.push(entry);
         scores.sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
