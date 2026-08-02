@@ -295,8 +295,7 @@ const server = http.createServer((req,res)=>{
     const fmt = (x)=> Number(x||0).toLocaleString('nl-NL');
     const rawBest = stats.bestDistance || 0;
     const record  = Math.max(v.bestDistance||0, lbBest);      // hoogste dóór een run bevestigde afstand
-    const avgPerRun = v.plays > 0 ? v.totalDistance / v.plays : 6000;   // measured avg (fallback until validated runs exist)
-    const estKm = Math.round((stats.plays||0) * avgPerRun / 1000);      // all-time estimate — exact history was never recorded
+    const validKm = Math.round((v.totalDistance||0) / 1000);           // exact distance, measured since security
     const sinceStr = v.since ? new Date(v.since).toLocaleDateString('nl-NL',{day:'numeric',month:'long',year:'numeric'}) : '—';
     const flag = rawBest > record
       ? `<div class=warn>⚠️ Ruw gemeld record: <b>${fmt(rawBest)} m</b>, maar het hoogste dóór een echte run bevestigde record is <b>${fmt(record)} m</b>. Dat verschil is door geen enkele gespeelde run onderbouwd — waarschijnlijk rechtstreeks naar de statistieken gestuurd.</div>`
@@ -319,15 +318,15 @@ small{color:#8a9a8c}</style>
 ${flag}
 <div class="c"><h2>🚜 Alle runs</h2><p class=sub>Iedereen bij elkaar, sinds de start.</p>
 <div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(stats.plays)}</span></div>
-<div class=s><span class=l>Totale afstand (schatting)</span><span class=n>≈ ${fmt(estKm)} km</span></div>
 <div class=s><span class=l>Langste stoet</span><span class=n>${fmt(stats.longestConvoy)} 🚜</span></div>
-<div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(stats.totalTractors)}</span></div></div>
+<div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(stats.totalTractors)}</span></div>
+<div class=s><span class=l>Totale afstand (exact, sinds beveiliging)</span><span class=n>${fmt(validKm)} km</span></div></div>
 <div class="c rec"><h2>🏁 Records</h2><p class=sub>Uit het highscore-bord — bevestigde inzendingen.</p>
 <div class=s><span class=l>Beste afstand (bevestigd)</span><span class=n>${fmt(record)} m</span></div>
 <div class=s><span class=l>Afstand — alle records samen</span><span class=n>${fmt(lbTotal)} m</span></div>
 <div class=s><span class=l>Trekkers — alle records samen</span><span class=n>${fmt(lbTrek)}</span></div>
 <div class=s><span class=l>Aantal highscores</span><span class=n>${fmt(named.length)}</span></div></div>
-<p class=note><small>De totale afstand is een schatting (aantal runs × de gemeten gemiddelde afstand per run), want het exacte totaal van vóór de meting is niet vastgelegd — vanaf nu wordt het wél exact bijgehouden.<br>Sinds de beveiliging (${sinceStr}) zijn <b>${fmt(v.plays)}</b> runs volledig gevalideerd. Oudere runs van vóór die datum tellen wél mee in "Alle runs", maar konden niet achteraf gevalideerd worden.<br>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
+<p class=note><small>Totale afstand wordt exact gemeten sinds de beveiliging (${sinceStr}); daarvóór is de afstand nooit vastgelegd, dus die telt niet mee. Keren gespeeld, langste stoet en tractoren-totaal zijn wél de complete tellers vanaf de start.<br>Volledig gevalideerde runs sinds de beveiliging: <b>${fmt(v.plays)}</b>.<br>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
     return send(res,200,'text/html; charset=utf-8', html, origin);
   }
 
