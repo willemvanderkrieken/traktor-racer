@@ -595,6 +595,7 @@ function endGame(win, title){
     if (navigator.sendBeacon) navigator.sendBeacon('/api/result', new Blob([body], {type:'application/json'}));
     else fetch('/api/result', {method:'POST', headers:{'Content-Type':'application/json'}, body, keepalive:true}).catch(()=>{});
   } catch(e){}
+  recordValidatedRun(dist, convoyTotal);   // also record it through the validated path (clean stats)
   document.getElementById('endTitle').textContent = '💥 '+title;
   document.getElementById('endText').innerHTML =
     `<div class="stat hero"><span class="lbl">Score</span><span class="num">${score}</span></div>`+
@@ -1301,6 +1302,14 @@ function renderLeaderboard(d){
   }
   const el=document.getElementById('hsList'); el.innerHTML=h; el.style.display='block';
   document.getElementById('hsEntry').style.display='none';
+}
+// record every finished run through the validated path so the clean stats capture it (named or not)
+async function recordValidatedRun(dist, trek){
+  if(!runTok) return;
+  try {
+    await fetch('/api/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ n:runTok.n, t:runTok.t, distance:Math.max(0,Math.floor(dist)) })});
+    await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ distance:Math.max(0,Math.floor(dist)), trekkers:Math.max(0,Math.floor(trek)), t:runTok.t, n:runTok.n, sig:runTok.sig })});
+  } catch(e){}
 }
 async function submitScore(){
   const name = (document.getElementById('hsName').value||'').trim();

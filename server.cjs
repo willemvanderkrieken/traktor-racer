@@ -51,7 +51,8 @@ const MAX_DISTANCE = 2000000;      // absolute sanity cap (m)
 const DIST_MARGIN  = 120;          // telemetry tolerance (m)
 const MAX_SCORES   = 500;
 
-const usedNonces  = new Map();     // nonce -> time used (replay guard)
+const usedNonces  = new Map();     // nonce -> time used (replay guard, leaderboard)
+const runCounted  = new Map();     // nonce -> time counted into the validated stats (each run counts once)
 const runProgress = new Map();     // nonce -> { dist, ts } furthest distance the run actually reported
 function hmac(secret, msg){ return crypto.createHmac('sha256', secret).update(msg).digest('hex'); }
 function eqHex(a, b){ a=String(a||''); b=String(b||''); if(a.length!==b.length || !a) return false; try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch(e){ return false; } }
@@ -73,6 +74,30 @@ let scores = [];         // [{name, distance, trekkers, ts}]  sorted high->low b
 try { fs.mkdirSync(DATA_DIR, { recursive:true }); } catch(e){}
 try { Object.assign(stats, JSON.parse(fs.readFileSync(STATS_FILE,'utf8'))); } catch(e){}
 try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArray(s)) scores = s; } catch(e){}
+// buffered + atomic persistence flags (declared before the seed below uses `dirty`)
+let dirty = false, scoresDirty = false, lastSelfWrite = 0;
+// validated ("clean") stats: trustworthy aggregates from runs that passed the anti-cheat.
+// seed once from the current leaderboard so there's a meaningful baseline from day one.
+if(!stats.valid){
+  const named = scores.filter(isNamed);
+  stats.valid = {
+    plays:         named.length,
+    bestDistance:  named.reduce((m,s)=>Math.max(m, s.distance), 0),
+    longestConvoy: named.reduce((m,s)=>Math.max(m, s.trekkers), 0),
+    totalTractors: named.reduce((a,s)=>a + s.trekkers, 0),
+    totalDistance: named.reduce((a,s)=>a + s.distance, 0)
+  };
+  dirty = true;
+}
+function countValidatedRun(n, dist, trek){       // count a validated run once into the clean stats
+  if(!n || runCounted.has(n)) return;
+  runCounted.set(n, Date.now());
+  const v = stats.valid;
+  v.plays++; v.totalDistance += dist; v.totalTractors += trek;
+  if(dist > v.bestDistance)  v.bestDistance  = dist;
+  if(trek > v.longestConvoy) v.longestConvoy = trek;
+  dirty = true;
+}
 
 function cleanName(v){
   return String(v==null?'':v).replace(/[\x00-\x1f\x7f]+/g,' ').replace(/\s+/g,' ').trim().slice(0,24) || 'Anoniem';
@@ -83,10 +108,10 @@ let game = '<h1>Game bestand ontbreekt</h1>';
 try { game = fs.readFileSync(GAME_FILE,'utf8'); } catch(e){}
 
 // buffered + atomic persistence (tmp file then rename) so nothing corrupts under load
-let dirty = false, scoresDirty = false, lastSelfWrite = 0;
 function persist(){
   const cutoff = Date.now() - TOKEN_TTL_MS;
   for(const [n,ts] of usedNonces){ if(ts < cutoff) usedNonces.delete(n); }
+  for(const [n,ts] of runCounted){ if(ts < cutoff) runCounted.delete(n); }
   for(const [n,o] of runProgress){ if(o.ts < cutoff) runProgress.delete(n); }
   if(dirty){ dirty = false;
     try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
@@ -136,6 +161,7 @@ const server = http.createServer((req,res)=>{
         if(dist > stats.bestDistance)  stats.bestDistance  = dist;
         if(conv > stats.longestConvoy) stats.longestConvoy = conv;
         stats.totalTractors += conv;
+        stats.totalDistance = (stats.totalDistance||0) + dist;
         stats.updated = new Date().toISOString();
         dirty = true;
       } catch(e){}
@@ -171,6 +197,31 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
+  // record a validated finished run into the clean stats (no name, not on the board).
+  // fired for EVERY completed run so the clean stats also capture runs that were never submitted as a highscore.
+  if(req.method==='POST' && u.pathname==='/api/run'){
+    if(rateLimited(ip, 30, 60000)) return send(res,429,'text/plain','slow down', origin);
+    let b=''; let abort=false;
+    req.on('data', c=>{ b+=c; if(b.length>1000){ abort=true; req.destroy(); } });
+    req.on('end', ()=>{
+      if(abort) return;
+      try{
+        const d = JSON.parse(b || '{}');
+        const dist = Math.max(0, Math.min(1e7, Math.floor(Number(d.distance)||0)));
+        const trek = Math.max(0, Math.min(1e6, Math.floor(Number(d.trekkers)||0)));
+        const t = Math.floor(Number(d.t)||0), n = String(d.n||''), sig = String(d.sig||'');
+        const now = Date.now();
+        const rep = runProgress.get(n);
+        const ok = eqHex(sig, hmac(SIGN_SECRET, t+'.'+n)) && (now - t <= TOKEN_TTL_MS) && (t - now <= 60000)
+                   && dist <= MAX_DISTANCE && (now - t) >= (dist / MAX_MPS) * 1000
+                   && rep && dist <= rep.dist + DIST_MARGIN;
+        if(ok) countValidatedRun(n, dist, trek);   // counts once per nonce; does NOT consume the leaderboard nonce
+      } catch(e){}
+      send(res,204,'text/plain','', origin);
+    });
+    return;
+  }
+
   // hand out a fresh, signed start-token when a run begins
   if(u.pathname==='/api/score-token'){
     if(rateLimited(ip, 40, 60000)) return send(res,429,'application/json', JSON.stringify({error:'rate'}), origin);
@@ -200,6 +251,7 @@ const server = http.createServer((req,res)=>{
         const rep = runProgress.get(n);                // the run must actually have reported getting this far
         if(!rep || dist > rep.dist + DIST_MARGIN)      return send(res,403,'application/json', JSON.stringify({error:'telemetry-mismatch'}), origin);
         usedNonces.set(n, now);
+        countValidatedRun(n, dist, trek);   // also count into the clean stats (once per nonce; /api/run may already have)
         const entry = { name, distance:dist, trekkers:trek, ts:Date.now() };
         scores.push(entry);
         scores.sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
@@ -228,22 +280,46 @@ const server = http.createServer((req,res)=>{
   if(u.pathname==='/api/stats' || u.pathname==='/stats'){
     if((u.searchParams.get('key')||'') !== STATS_KEY) return send(res,403,'text/plain','Forbidden', origin);
     if(u.pathname==='/api/stats') return send(res,200,'application/json', JSON.stringify(stats), origin);
+    const v = stats.valid || {plays:0,bestDistance:0,longestConvoy:0,totalTractors:0,totalDistance:0};
+    const named = scores.filter(isNamed);
+    const lbTotal = named.reduce((a,s)=>a + s.distance, 0);
+    const fmt = (x)=> Number(x||0).toLocaleString('nl-NL');
+    const rawBest = stats.bestDistance || 0;
+    const flag = rawBest > v.bestDistance
+      ? `<div class=warn>⚠️ De <b>ruwe</b> verste afstand (${fmt(rawBest)} m) ligt boven de gevalideerde (${fmt(v.bestDistance)} m). Dat verschil is door geen enkele gevalideerde run bevestigd — mogelijk rechtstreeks naar de statistieken gestuurd.</div>`
+      : '';
     const html = `<!doctype html><html lang=nl><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>T.O.T.-rit Boekel — statistieken</title>
-<style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#eef3e6;color:#2b3a2f;margin:0;padding:26px}
-.c{max-width:440px;margin:auto;background:#fff;border-radius:18px;padding:22px 24px;box-shadow:0 10px 34px rgba(0,0,0,.12);border:3px solid #ffcf33}
-h1{color:#2e7d32;font-size:22px;margin:0 0 14px}
-.s{display:flex;justify-content:space-between;align-items:baseline;padding:12px 2px;border-bottom:2px solid #eef3e6}
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#eef3e6;color:#2b3a2f;margin:0;padding:22px}
+.c{max-width:460px;margin:0 auto 18px;background:#fff;border-radius:18px;padding:20px 22px;box-shadow:0 10px 34px rgba(0,0,0,.12);border:3px solid #ffcf33}
+.c.raw{border-color:#e0a0a0}
+h1{color:#2e7d32;font-size:21px;margin:0 0 12px;text-align:center}h2{font-size:16px;margin:0 0 4px}
+.clean h2{color:#2e7d32}.raw h2{color:#b23b3b}
+.sub{color:#8a9a8c;font-size:12px;margin:0 0 10px}
+.s{display:flex;justify-content:space-between;align-items:baseline;padding:11px 2px;border-bottom:2px solid #eef3e6}
 .s:last-of-type{border-bottom:none}.s .l{color:#6b7d6e;font-weight:800;font-size:14px}
-.s .n{color:#e65100;font-weight:900;font-size:26px;font-variant-numeric:tabular-nums}
+.s .n{color:#e65100;font-weight:900;font-size:24px;font-variant-numeric:tabular-nums}
+.raw .s .n{color:#b23b3b}
+.warn{max-width:460px;margin:0 auto 14px;background:#fff4f4;border:2px solid #e0a0a0;border-radius:12px;padding:12px 14px;color:#8a3b3b;font-size:13px;line-height:1.4}
 small{color:#8a9a8c}</style>
-<div class=c><h1>🚜 T.O.T.-rit Boekel — statistieken</h1>
-<div class=s><span class=l>Keren gespeeld</span><span class=n>${stats.plays}</span></div>
-<div class=s><span class=l>Verste afstand</span><span class=n>${stats.bestDistance} m</span></div>
-<div class=s><span class=l>Langste stoet</span><span class=n>${stats.longestConvoy} 🚜</span></div>
-<div class=s><span class=l>Tractoren totaal</span><span class=n>${stats.totalTractors}</span></div>
-<p><small>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></div></html>`;
+<h1>🚜 T.O.T.-rit Boekel — statistieken</h1>
+${flag}
+<div class="c clean"><h2>✅ Schoon — gevalideerde runs</h2><p class=sub>Alleen runs die de anti-cheat doorstonden (ook niet-opgeslagen highscores tellen mee).</p>
+<div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(v.plays)}</span></div>
+<div class=s><span class=l>Verste afstand</span><span class=n>${fmt(v.bestDistance)} m</span></div>
+<div class=s><span class=l>Langste stoet</span><span class=n>${fmt(v.longestConvoy)} 🚜</span></div>
+<div class=s><span class=l>Totale afstand — iedereen samen</span><span class=n>${fmt(v.totalDistance)} m</span></div>
+<div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(v.totalTractors)}</span></div>
+<div class=s><span class=l>Highscores op het bord</span><span class=n>${fmt(named.length)}</span></div>
+<div class=s><span class=l>Afstand — alle highscores samen</span><span class=n>${fmt(lbTotal)} m</span></div></div>
+<div class="c raw"><h2>⚠️ Ruw — onbeveiligd (mogelijk vervalst)</h2><p class=sub>Rechtstreeks gemelde cijfers zonder controle — alleen ter vergelijking.</p>
+<div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(stats.plays)}</span></div>
+<div class=s><span class=l>Verste afstand</span><span class=n>${fmt(stats.bestDistance)} m</span></div>
+<div class=s><span class=l>Langste stoet</span><span class=n>${fmt(stats.longestConvoy)} 🚜</span></div>
+<div class=s><span class=l>Totale afstand</span><span class=n>${fmt(stats.totalDistance||0)} m</span></div>
+<div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(stats.totalTractors)}</span></div></div>
+<p style="text-align:center"><small>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
     return send(res,200,'text/html; charset=utf-8', html, origin);
   }
 
