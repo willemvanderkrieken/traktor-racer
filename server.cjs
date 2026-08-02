@@ -304,31 +304,27 @@ const server = http.createServer((req,res)=>{
 <title>T.O.T.-rit Boekel — statistieken</title>
 <style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#eef3e6;color:#2b3a2f;margin:0;padding:22px}
 .c{max-width:460px;margin:0 auto 18px;background:#fff;border-radius:18px;padding:20px 22px;box-shadow:0 10px 34px rgba(0,0,0,.12);border:3px solid #ffcf33}
-.c.rec{border-color:#9ccc9e}.c.val{border-color:#8fbfe0}
+.c.rec{border-color:#9ccc9e}
 h1{color:#2e7d32;font-size:21px;margin:0 0 12px;text-align:center}h2{font-size:16px;margin:0 0 4px;color:#2e7d32}
 .sub{color:#8a9a8c;font-size:12px;margin:0 0 10px}
 .s{display:flex;justify-content:space-between;align-items:baseline;padding:11px 2px;border-bottom:2px solid #eef3e6}
 .s:last-of-type{border-bottom:none}.s .l{color:#6b7d6e;font-weight:800;font-size:14px}
 .s .n{color:#e65100;font-weight:900;font-size:24px;font-variant-numeric:tabular-nums}
 .warn{max-width:460px;margin:0 auto 14px;background:#fff4f4;border:2px solid #e0a0a0;border-radius:12px;padding:12px 14px;color:#8a3b3b;font-size:13px;line-height:1.4}
+.note{max-width:460px;margin:0 auto;text-align:center;line-height:1.5}
 small{color:#8a9a8c}</style>
 <h1>🚜 T.O.T.-rit Boekel — statistieken</h1>
 ${flag}
-<div class="c"><h2>🚜 Community — alle runs</h2><p class=sub>Alle gespeelde runs sinds de start (ongefilterd geteld).</p>
+<div class="c"><h2>🚜 Alle runs</h2><p class=sub>Iedereen bij elkaar, sinds de start.</p>
 <div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(stats.plays)}</span></div>
 <div class=s><span class=l>Langste stoet</span><span class=n>${fmt(stats.longestConvoy)} 🚜</span></div>
 <div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(stats.totalTractors)}</span></div></div>
-<div class="c rec"><h2>🏁 Highscore-records</h2><p class=sub>Uit het bord — bevestigde inzendingen.</p>
-<div class=s><span class=l>Beste afstand</span><span class=n>${fmt(lbBest)} m</span></div>
+<div class="c rec"><h2>🏁 Records</h2><p class=sub>Uit het highscore-bord — bevestigde inzendingen.</p>
+<div class=s><span class=l>Beste afstand (bevestigd)</span><span class=n>${fmt(record)} m</span></div>
 <div class=s><span class=l>Afstand — alle records samen</span><span class=n>${fmt(lbTotal)} m</span></div>
 <div class=s><span class=l>Trekkers — alle records samen</span><span class=n>${fmt(lbTrek)}</span></div>
 <div class=s><span class=l>Aantal highscores</span><span class=n>${fmt(named.length)}</span></div></div>
-<div class="c val"><h2>✅ Gevalideerd — sinds ${sinceStr}</h2><p class=sub>Runs die de anti-cheat doorstaan; groeit vanaf het inschakelen van de beveiliging.</p>
-<div class=s><span class=l>Gevalideerde runs</span><span class=n>${fmt(v.plays)}</span></div>
-<div class=s><span class=l>Afstand — iedereen samen</span><span class=n>${fmt(v.totalDistance)} m</span></div>
-<div class=s><span class=l>Tractoren</span><span class=n>${fmt(v.totalTractors)}</span></div>
-<div class=s><span class=l>Verste afstand (bevestigd)</span><span class=n>${fmt(record)} m</span></div></div>
-<p style="text-align:center"><small>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
+<p class=note><small>Sinds de beveiliging (${sinceStr}) zijn <b>${fmt(v.plays)}</b> runs volledig gevalideerd. Oudere runs van vóór die datum tellen wél mee in "Alle runs", maar konden niet achteraf gevalideerd worden.<br>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
     return send(res,200,'text/html; charset=utf-8', html, origin);
   }
 
