@@ -1,34 +1,62 @@
 // Tiny zero-dependency server for Traktor Racer.
 // - serves the game (traktor-racer.html) at /
-// - POST /api/result  {distance, convoy}  -> aggregates 4 global stats in memory
-// - GET  /stats?key=…  -> private stats page (only the owner, via secret key)
-// - GET  /api/stats?key=…  -> same stats as JSON
-// Stats are kept in memory (safe under concurrency: Node is single-threaded, so each
-// request's read-modify-write runs without interleaving) and persisted atomically.
+// - POST /api/result   {distance, convoy}      -> aggregates 4 global stats
+// - POST /api/progress {n, distance}           -> per-run telemetry (furthest reached), used to validate a score
+// - GET  /api/score-token                      -> a fresh HMAC-signed {t, n, sig} for a run
+// - POST /api/score     {name,distance,trekkers,t,n,sig} -> validated highscore submission
+// - GET  /api/scores                           -> public top-20 leaderboard
+// - GET  /stats?key=… / /api/stats?key=…       -> private owner stats
+//
+// Deleting scores is NOT a web endpoint (see admin-scores.cjs, run in the container).
+// Secrets have NO in-code defaults: the server refuses to start without strong env vars.
 
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT      = process.env.PORT || 3000;
-const KEY       = process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2';   // override via env in production
-const ADMIN_USER= process.env.ADMIN_USER || 'boekel';                 // admin login for deleting scores
-const ADMIN_PASS= process.env.ADMIN_PASS || 'trekker-'+ (process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2');  // override via env!
-// --- anti-cheat: score submissions must carry a fresh, single-use, signed start-token + a client signature ---
-const SIGN_SECRET   = process.env.SIGN_SECRET   || 'tot-sign-' + (process.env.STATS_KEY || 'GCMumtU50oNOrqTpLig2'); // signs start-tokens (server only)
-const CLIENT_SECRET = process.env.CLIENT_SECRET || 'frikandel-mayo-7Kq2Zx91';   // shared with the game client (must match the JS)
-const TOKEN_TTL_MS  = 60*60*1000;   // a start-token is valid for 60 minutes
-const MAX_MPS       = 150;          // generous max metres/second (real runs are far slower) -> minimum plausible run time
-const usedNonces    = new Map();    // nonce -> time used, so a token can't be replayed
+const PORT       = process.env.PORT || 3000;
+const DATA_DIR   = process.env.DATA_DIR || '/data';
+const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
+const GAME_FILE  = path.join(__dirname, 'traktor-racer.html');
+
+// --- required secrets: no repo defaults; refuse to start on a missing/placeholder value ---
+function requireSecret(name){
+  const v = process.env[name];
+  const placeholder = /^(changeme|change-me|change_me|placeholder|secret|password|example|test|GCMumtU50oNOrqTpLig2)$/i;
+  if(!v || v.length < 16 || placeholder.test(v)){
+    console.error('FATAL: env var ' + name + ' is missing or a placeholder. Set a strong random value (>=16 chars) in Coolify before deploying.');
+    process.exit(1);
+  }
+  return v;
+}
+const STATS_KEY   = requireSecret('STATS_KEY');    // protects the private /stats page
+const SIGN_SECRET = requireSecret('SIGN_SECRET');  // signs the run start-tokens (server-only)
+const ALLOW_ORIGIN= process.env.ALLOW_ORIGIN || 'https://totrit.inboekel.nl';
+
+const TOKEN_TTL_MS = 60*60*1000;   // a start-token is valid for 60 minutes
+const MAX_MPS      = 150;          // plausibility: max metres/second -> minimum plausible run time
+const MAX_DISTANCE = 2000000;      // absolute sanity cap (m)
+const DIST_MARGIN  = 120;          // telemetry tolerance (m)
+const MAX_SCORES   = 500;
+
+const usedNonces  = new Map();     // nonce -> time used (replay guard)
+const runProgress = new Map();     // nonce -> { dist, ts } furthest distance the run actually reported
 function hmac(secret, msg){ return crypto.createHmac('sha256', secret).update(msg).digest('hex'); }
 function eqHex(a, b){ a=String(a||''); b=String(b||''); if(a.length!==b.length || !a) return false; try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch(e){ return false; } }
-const DATA_DIR  = process.env.DATA_DIR || '/data';
-const STATS_FILE= path.join(DATA_DIR, 'stats.json');
-const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
-const GAME_FILE = path.join(__dirname, 'traktor-racer.html');
 
-const MAX_SCORES = 500;  // how many we keep on disk (so a player's rank + neighbours stay meaningful)
+// --- simple in-memory per-IP rate limiting ---
+const rl = new Map();   // ip -> { count, start }
+function rateLimited(ip, limit, windowMs){
+  const now = Date.now(); let e = rl.get(ip);
+  if(!e || now - e.start > windowMs){ e = { count:0, start:now }; rl.set(ip, e); }
+  e.count++; return e.count > limit;
+}
+function clientIp(req){
+  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xf || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
 
 let stats = { plays:0, bestDistance:0, longestConvoy:0, totalTractors:0, updated:null };
 let scores = [];         // [{name, distance, trekkers, ts}]  sorted high->low by distance
@@ -39,28 +67,23 @@ try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArra
 function cleanName(v){
   return String(v==null?'':v).replace(/[\x00-\x1f\x7f]+/g,' ').replace(/\s+/g,' ').trim().slice(0,24) || 'Anoniem';
 }
-// a score is only shown on the leaderboard if it has a real name (anonymous ones are hidden)
 function isNamed(s){ const n=((s&&s.name)||'').trim().toLowerCase(); return !!n && n!=='anoniem'; }
 
 let game = '<h1>Game bestand ontbreekt</h1>';
 try { game = fs.readFileSync(GAME_FILE,'utf8'); } catch(e){}
 
 // buffered + atomic persistence (tmp file then rename) so nothing corrupts under load
-let dirty = false, scoresDirty = false;
-// one-time data fix: give the record-holder a proper name (idempotent — only matches while still 'Anoniem')
-{ const rec = scores.find(s=> s.ts===1785566034117); if(rec && rec.name==='Anoniem'){ rec.name='Sanne van den Elzen'; scoresDirty=true; } }
-// one-time cleanup: remove the fake #1 record (ZZ-TEST-CLAUDE, 999999 m) — idempotent
-{ const i = scores.findIndex(s=> s.ts===1785580257558); if(i>=0){ scores.splice(i,1); scoresDirty=true; } }
+let dirty = false, scoresDirty = false, lastSelfWrite = 0;
 function persist(){
-  // drop expired nonces so the used-token set stays small
   const cutoff = Date.now() - TOKEN_TTL_MS;
   for(const [n,ts] of usedNonces){ if(ts < cutoff) usedNonces.delete(n); }
+  for(const [n,o] of runProgress){ if(o.ts < cutoff) runProgress.delete(n); }
   if(dirty){ dirty = false;
     try { const tmp = STATS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(stats)); fs.renameSync(tmp, STATS_FILE); }
     catch(e){ dirty = true; }
   }
   if(scoresDirty){ scoresDirty = false;
-    try { const tmp = SCORES_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(scores)); fs.renameSync(tmp, SCORES_FILE); }
+    try { const tmp = SCORES_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(scores)); fs.renameSync(tmp, SCORES_FILE); lastSelfWrite = Date.now(); }
     catch(e){ scoresDirty = true; }
   }
 }
@@ -68,16 +91,29 @@ setInterval(persist, 2000);
 process.on('SIGTERM', ()=>{ persist(); process.exit(0); });
 process.on('SIGINT',  ()=>{ persist(); process.exit(0); });
 
-function send(res, code, type, body){
-  res.writeHead(code, { 'Content-Type':type, 'Cache-Control':'no-store', 'Access-Control-Allow-Origin':'*' });
-  res.end(body);
+// pick up external edits (the admin-scores.cjs maintenance script) without a restart
+try {
+  fs.watch(DATA_DIR, { persistent:false }, (ev, fname)=>{
+    if(fname !== 'scores.json') return;
+    if(Date.now() - lastSelfWrite < 1500) return;       // ignore our own atomic writes
+    try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArray(s)) scores = s; } catch(e){}
+  });
+} catch(e){}
+
+function send(res, code, type, body, origin){
+  const h = { 'Content-Type':type, 'Cache-Control':'no-store' };
+  if(origin && origin === ALLOW_ORIGIN) h['Access-Control-Allow-Origin'] = origin;   // same-origin only, not *
+  res.writeHead(code, h); res.end(body);
 }
 
 const server = http.createServer((req,res)=>{
   let u; try { u = new URL(req.url, 'http://x'); } catch(e){ return send(res,400,'text/plain','bad'); }
+  const origin = req.headers.origin || '';
+  const ip = clientIp(req);
 
-  // record a finished run
+  // record a finished run (global stats)
   if(req.method==='POST' && u.pathname==='/api/result'){
+    if(rateLimited(ip, 40, 60000)) return send(res,429,'text/plain','slow down', origin);
     let b=''; let abort=false;
     req.on('data', c=>{ b+=c; if(b.length>2000){ abort=true; req.destroy(); } });
     req.on('end', ()=>{
@@ -93,19 +129,48 @@ const server = http.createServer((req,res)=>{
         stats.updated = new Date().toISOString();
         dirty = true;
       } catch(e){}
-      send(res,204,'text/plain','');
+      send(res,204,'text/plain','', origin);
     });
     return;
   }
 
-  // hand out a fresh, signed start-token when a run begins (used to validate the score later)
-  if(u.pathname==='/api/score-token'){
-    const t = Date.now(), n = crypto.randomBytes(9).toString('hex');
-    return send(res,200,'application/json', JSON.stringify({ t, n, sig: hmac(SIGN_SECRET, t+'.'+n) }));
+  // per-run telemetry: the game reports how far it has actually gotten (keyed by the run's nonce)
+  if(req.method==='POST' && u.pathname==='/api/progress'){
+    if(rateLimited(ip, 150, 60000)) return send(res,429,'text/plain','slow down', origin);
+    let b=''; let abort=false;
+    req.on('data', c=>{ b+=c; if(b.length>500){ abort=true; req.destroy(); } });
+    req.on('end', ()=>{
+      if(abort) return;
+      try{
+        const d = JSON.parse(b || '{}');
+        const n = String(d.n||''), t = Math.floor(Number(d.t)||0);
+        const dist = Math.max(0, Math.min(1e7, Math.floor(Number(d.distance)||0)));
+        if(n && t){                       // reported distance can never grow faster than MAX_MPS in real time
+          const now = Date.now(), prev = runProgress.get(n);
+          if(!prev){
+            const cap = MAX_MPS * Math.max(0, now - t)/1000 + DIST_MARGIN;         // bounded by the token's age
+            runProgress.set(n, { dist: Math.min(dist, cap), ts: now });
+          } else {
+            const maxGain = MAX_MPS * (now - prev.ts)/1000 + DIST_MARGIN;
+            runProgress.set(n, { dist: Math.max(prev.dist, Math.min(dist, prev.dist + maxGain)), ts: now });
+          }
+        }
+      } catch(e){}
+      send(res,204,'text/plain','', origin);
+    });
+    return;
   }
 
-  // submit a highscore (name only) — returns the top list + the player's rank
+  // hand out a fresh, signed start-token when a run begins
+  if(u.pathname==='/api/score-token'){
+    if(rateLimited(ip, 40, 60000)) return send(res,429,'application/json', JSON.stringify({error:'rate'}), origin);
+    const t = Date.now(), n = crypto.randomBytes(9).toString('hex');
+    return send(res,200,'application/json', JSON.stringify({ t, n, sig: hmac(SIGN_SECRET, t+'.'+n) }), origin);
+  }
+
+  // submit a highscore — validated against the run's own token + telemetry + plausible time
   if(req.method==='POST' && u.pathname==='/api/score'){
+    if(rateLimited(ip, 20, 60000)) return send(res,429,'application/json', JSON.stringify({error:'rate'}), origin);
     let b=''; let abort=false;
     req.on('data', c=>{ b+=c; if(b.length>3000){ abort=true; req.destroy(); } });
     req.on('end', ()=>{
@@ -115,14 +180,15 @@ const server = http.createServer((req,res)=>{
         const name = cleanName(d.name);
         const dist = Math.max(0, Math.min(1e7, Math.floor(Number(d.distance)||0)));
         const trek = Math.max(0, Math.min(1e6, Math.floor(Number(d.trekkers)||0)));
-        // --- anti-cheat validation: authentic single-use token + client signature + plausible run time ---
-        const t = Math.floor(Number(d.t)||0), n = String(d.n||''), sig = String(d.sig||''), csig = String(d.csig||'');
+        const t = Math.floor(Number(d.t)||0), n = String(d.n||''), sig = String(d.sig||'');
         const now = Date.now();
-        if(!eqHex(sig, hmac(SIGN_SECRET, t+'.'+n)))                                  return send(res,403,'application/json', JSON.stringify({error:'bad-token'}));
-        if(now - t > TOKEN_TTL_MS || t - now > 60000)                               return send(res,403,'application/json', JSON.stringify({error:'expired'}));
-        if(usedNonces.has(n))                                                        return send(res,403,'application/json', JSON.stringify({error:'replay'}));
-        if(!eqHex(csig, hmac(CLIENT_SECRET, dist+'.'+trek+'.'+t+'.'+n)))             return send(res,403,'application/json', JSON.stringify({error:'bad-sig'}));
-        if((now - t) < (dist / MAX_MPS) * 1000)                                      return send(res,403,'application/json', JSON.stringify({error:'too-fast'}));
+        if(!eqHex(sig, hmac(SIGN_SECRET, t+'.'+n)))    return send(res,403,'application/json', JSON.stringify({error:'bad-token'}), origin);
+        if(now - t > TOKEN_TTL_MS || t - now > 60000)  return send(res,403,'application/json', JSON.stringify({error:'expired'}), origin);
+        if(usedNonces.has(n))                          return send(res,403,'application/json', JSON.stringify({error:'replay'}), origin);
+        if(dist > MAX_DISTANCE)                        return send(res,403,'application/json', JSON.stringify({error:'too-far'}), origin);
+        if((now - t) < (dist / MAX_MPS) * 1000)        return send(res,403,'application/json', JSON.stringify({error:'too-fast'}), origin);
+        const rep = runProgress.get(n);                // the run must actually have reported getting this far
+        if(!rep || dist > rep.dist + DIST_MARGIN)      return send(res,403,'application/json', JSON.stringify({error:'telemetry-mismatch'}), origin);
         usedNonces.set(n, now);
         const entry = { name, distance:dist, trekkers:trek, ts:Date.now() };
         scores.push(entry);
@@ -130,53 +196,28 @@ const server = http.createServer((req,res)=>{
         if(scores.length > MAX_SCORES) scores.length = MAX_SCORES;
         scoresDirty = true;
         const named = scores.filter(isNamed);     // anonymous scores are never shown
-        const top = named.slice(0, 10);           // top 10 of the named leaderboard
-        let rank = 0, around = [], aroundFrom = 0; // a window of 10 above + you + 10 below
+        const top = named.slice(0, 10);
+        let rank = 0, around = [], aroundFrom = 0;
         if(isNamed(entry)){
           rank = named.indexOf(entry) + 1;
           const from = Math.max(0, rank-11), to = Math.min(named.length, rank+10);
           around = named.slice(from, to); aroundFrom = from + 1;
         }
-        return send(res,200,'application/json', JSON.stringify({ rank, total: named.length, top, around, aroundFrom }));
-      } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'})); }
+        return send(res,200,'application/json', JSON.stringify({ rank, total: named.length, top, around, aroundFrom }), origin);
+      } catch(e){ return send(res,400,'application/json', JSON.stringify({error:'bad'}), origin); }
     });
     return;
   }
 
-  // admin: delete a score, by leaderboard rank (delete-score=1) or by exact id (delete-ts=...).
-  // requires user + password. Example: /admin/delete?delete-score=1&user=boekel&password=...
-  if(u.pathname==='/admin/delete' || u.searchParams.has('delete-score') || u.searchParams.has('delete-ts')){
-    const user = u.searchParams.get('user') || '';
-    const pass = u.searchParams.get('password') || '';
-    if(user !== ADMIN_USER || pass !== ADMIN_PASS){
-      return send(res,403,'application/json', JSON.stringify({error:'forbidden'}));
-    }
-    // work on the sorted, named leaderboard (same view the public sees)
-    const named = scores.filter(isNamed).slice().sort((a,b)=> b.distance-a.distance || a.ts-b.ts);
-    let removed = null;
-    const tsParam = u.searchParams.get('delete-ts');
-    if(tsParam){
-      const ts = Number(tsParam);
-      const i = scores.findIndex(s=> s.ts===ts);
-      if(i>=0){ removed = scores.splice(i,1)[0]; scoresDirty = true; }
-    } else {
-      const rank = Math.floor(Number(u.searchParams.get('delete-score')) || 0);
-      const target = named[rank-1];
-      if(target){ const i = scores.findIndex(s=> s.ts===target.ts); if(i>=0){ removed = scores.splice(i,1)[0]; scoresDirty = true; } }
-    }
-    const top = scores.filter(isNamed).slice().sort((a,b)=> b.distance-a.distance || a.ts-b.ts).slice(0,20);
-    return send(res,200,'application/json', JSON.stringify({ ok: !!removed, removed, top }));
-  }
-
   // public leaderboard (top 20)
   if(u.pathname==='/api/scores'){
-    return send(res,200,'application/json', JSON.stringify({ top: scores.filter(isNamed).slice(0,20) }));
+    return send(res,200,'application/json', JSON.stringify({ top: scores.filter(isNamed).slice(0,20) }), origin);
   }
 
   // private stats (owner only)
   if(u.pathname==='/api/stats' || u.pathname==='/stats'){
-    if((u.searchParams.get('key')||'') !== KEY) return send(res,403,'text/plain','Forbidden');
-    if(u.pathname==='/api/stats') return send(res,200,'application/json', JSON.stringify(stats));
+    if((u.searchParams.get('key')||'') !== STATS_KEY) return send(res,403,'text/plain','Forbidden', origin);
+    if(u.pathname==='/api/stats') return send(res,200,'application/json', JSON.stringify(stats), origin);
     const html = `<!doctype html><html lang=nl><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>T.O.T.-rit Boekel — statistieken</title>
@@ -193,13 +234,13 @@ small{color:#8a9a8c}</style>
 <div class=s><span class=l>Langste stoet</span><span class=n>${stats.longestConvoy} 🚜</span></div>
 <div class=s><span class=l>Tractoren totaal</span><span class=n>${stats.totalTractors}</span></div>
 <p><small>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></div></html>`;
-    return send(res,200,'text/html; charset=utf-8', html);
+    return send(res,200,'text/html; charset=utf-8', html, origin);
   }
 
-  if(u.pathname==='/healthz') return send(res,200,'text/plain','ok');
+  if(u.pathname==='/healthz') return send(res,200,'text/plain','ok', origin);
   // serve the game for the homepage and for clean challenge links like /u/Naam/1240
-  if(req.method==='GET') return send(res,200,'text/html; charset=utf-8', game);
-  return send(res,404,'text/plain','Not found');
+  if(req.method==='GET') return send(res,200,'text/html; charset=utf-8', game, origin);
+  return send(res,404,'text/plain','Not found', origin);
 });
 
 server.listen(PORT, ()=> console.log('Traktor Racer server on :'+PORT));

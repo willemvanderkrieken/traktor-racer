@@ -1302,24 +1302,13 @@ function renderLeaderboard(d){
   const el=document.getElementById('hsList'); el.innerHTML=h; el.style.display='block';
   document.getElementById('hsEntry').style.display='none';
 }
-const CLIENT_SECRET = 'frikandel-mayo-7Kq2Zx91';   // shared with the server (score signature)
-async function hmacHex(secret, msg){
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(msg));
-  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('');
-}
 async function submitScore(){
   const name = (document.getElementById('hsName').value||'').trim();
-  const distI = Math.max(0, Math.floor(Number(lastDist)||0));   // sign/send the exact integers the server will use
+  const distI = Math.max(0, Math.floor(Number(lastDist)||0));
   const trekI = Math.max(0, Math.floor(Number(lastTrek)||0));
-  let extra = {};
-  try {
-    if(runTok && crypto.subtle){
-      const csig = await hmacHex(CLIENT_SECRET, distI+'.'+trekI+'.'+runTok.t+'.'+runTok.n);
-      extra = { t:runTok.t, n:runTok.n, sig:runTok.sig, csig };
-    }
-  } catch(e){}
+  // record this run's telemetry (the server bounds it by the token's age) before submitting the score
+  try { if(runTok) await fetch('/api/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ n:runTok.n, t:runTok.t, distance:distI })}); } catch(e){}
+  const extra = runTok ? { t:runTok.t, n:runTok.n, sig:runTok.sig } : {};
   const body = JSON.stringify({ name, distance:distI, trekkers:trekI, ...extra });
   fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},body})
     .then(r=>{ if(!r.ok) throw 0; return r.json(); })
