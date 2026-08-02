@@ -76,17 +76,24 @@ try { Object.assign(stats, JSON.parse(fs.readFileSync(STATS_FILE,'utf8'))); } ca
 try { const s = JSON.parse(fs.readFileSync(SCORES_FILE,'utf8')); if(Array.isArray(s)) scores = s; } catch(e){}
 // buffered + atomic persistence flags (declared before the seed below uses `dirty`)
 let dirty = false, scoresDirty = false, lastSelfWrite = 0;
-// validated ("clean") stats: trustworthy aggregates from runs that passed the anti-cheat.
-// seed once from the current leaderboard so there's a meaningful baseline from day one.
+// validated stats: forward-looking trust counters (grow from the moment the anti-cheat went live).
+// the record baseline (best/longest) is seeded from the existing leaderboard so the fraud-check is meaningful.
 if(!stats.valid){
   const named = scores.filter(isNamed);
   stats.valid = {
-    plays:         named.length,
+    since: Date.now(),
+    plays: 0, totalDistance: 0, totalTractors: 0,
     bestDistance:  named.reduce((m,s)=>Math.max(m, s.distance), 0),
-    longestConvoy: named.reduce((m,s)=>Math.max(m, s.trekkers), 0),
-    totalTractors: named.reduce((a,s)=>a + s.trekkers, 0),
-    totalDistance: named.reduce((a,s)=>a + s.distance, 0)
+    longestConvoy: named.reduce((m,s)=>Math.max(m, s.trekkers), 0)
   };
+  dirty = true;
+} else if(stats.valid.since === undefined){
+  // migrate an earlier over-seeded version: keep the record baseline, reset the forward counters to 0
+  const named = scores.filter(isNamed);
+  stats.valid.since = Date.now();
+  stats.valid.plays = 0; stats.valid.totalDistance = 0; stats.valid.totalTractors = 0;
+  stats.valid.bestDistance  = Math.max(stats.valid.bestDistance||0,  named.reduce((m,s)=>Math.max(m,s.distance),0));
+  stats.valid.longestConvoy = Math.max(stats.valid.longestConvoy||0, named.reduce((m,s)=>Math.max(m,s.trekkers),0));
   dirty = true;
 }
 function countValidatedRun(n, dist, trek){       // count a validated run once into the clean stats
@@ -280,45 +287,47 @@ const server = http.createServer((req,res)=>{
   if(u.pathname==='/api/stats' || u.pathname==='/stats'){
     if((u.searchParams.get('key')||'') !== STATS_KEY) return send(res,403,'text/plain','Forbidden', origin);
     if(u.pathname==='/api/stats') return send(res,200,'application/json', JSON.stringify(stats), origin);
-    const v = stats.valid || {plays:0,bestDistance:0,longestConvoy:0,totalTractors:0,totalDistance:0};
+    const v = stats.valid || {since:0,plays:0,totalDistance:0,totalTractors:0,bestDistance:0,longestConvoy:0};
     const named = scores.filter(isNamed);
+    const lbBest  = named.reduce((m,s)=>Math.max(m, s.distance), 0);
     const lbTotal = named.reduce((a,s)=>a + s.distance, 0);
+    const lbTrek  = named.reduce((a,s)=>a + s.trekkers, 0);
     const fmt = (x)=> Number(x||0).toLocaleString('nl-NL');
     const rawBest = stats.bestDistance || 0;
-    const flag = rawBest > v.bestDistance
-      ? `<div class=warn>⚠️ De <b>ruwe</b> verste afstand (${fmt(rawBest)} m) ligt boven de gevalideerde (${fmt(v.bestDistance)} m). Dat verschil is door geen enkele gevalideerde run bevestigd — mogelijk rechtstreeks naar de statistieken gestuurd.</div>`
+    const record  = Math.max(v.bestDistance||0, lbBest);      // hoogste dóór een run bevestigde afstand
+    const sinceStr = v.since ? new Date(v.since).toLocaleDateString('nl-NL',{day:'numeric',month:'long',year:'numeric'}) : '—';
+    const flag = rawBest > record
+      ? `<div class=warn>⚠️ Ruw gemeld record: <b>${fmt(rawBest)} m</b>, maar het hoogste dóór een echte run bevestigde record is <b>${fmt(record)} m</b>. Dat verschil is door geen enkele gespeelde run onderbouwd — waarschijnlijk rechtstreeks naar de statistieken gestuurd.</div>`
       : '';
     const html = `<!doctype html><html lang=nl><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>T.O.T.-rit Boekel — statistieken</title>
 <style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#eef3e6;color:#2b3a2f;margin:0;padding:22px}
 .c{max-width:460px;margin:0 auto 18px;background:#fff;border-radius:18px;padding:20px 22px;box-shadow:0 10px 34px rgba(0,0,0,.12);border:3px solid #ffcf33}
-.c.raw{border-color:#e0a0a0}
-h1{color:#2e7d32;font-size:21px;margin:0 0 12px;text-align:center}h2{font-size:16px;margin:0 0 4px}
-.clean h2{color:#2e7d32}.raw h2{color:#b23b3b}
+.c.rec{border-color:#9ccc9e}.c.val{border-color:#8fbfe0}
+h1{color:#2e7d32;font-size:21px;margin:0 0 12px;text-align:center}h2{font-size:16px;margin:0 0 4px;color:#2e7d32}
 .sub{color:#8a9a8c;font-size:12px;margin:0 0 10px}
 .s{display:flex;justify-content:space-between;align-items:baseline;padding:11px 2px;border-bottom:2px solid #eef3e6}
 .s:last-of-type{border-bottom:none}.s .l{color:#6b7d6e;font-weight:800;font-size:14px}
 .s .n{color:#e65100;font-weight:900;font-size:24px;font-variant-numeric:tabular-nums}
-.raw .s .n{color:#b23b3b}
 .warn{max-width:460px;margin:0 auto 14px;background:#fff4f4;border:2px solid #e0a0a0;border-radius:12px;padding:12px 14px;color:#8a3b3b;font-size:13px;line-height:1.4}
 small{color:#8a9a8c}</style>
 <h1>🚜 T.O.T.-rit Boekel — statistieken</h1>
 ${flag}
-<div class="c clean"><h2>✅ Schoon — gevalideerde runs</h2><p class=sub>Alleen runs die de anti-cheat doorstonden (ook niet-opgeslagen highscores tellen mee).</p>
-<div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(v.plays)}</span></div>
-<div class=s><span class=l>Verste afstand</span><span class=n>${fmt(v.bestDistance)} m</span></div>
-<div class=s><span class=l>Langste stoet</span><span class=n>${fmt(v.longestConvoy)} 🚜</span></div>
-<div class=s><span class=l>Totale afstand — iedereen samen</span><span class=n>${fmt(v.totalDistance)} m</span></div>
-<div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(v.totalTractors)}</span></div>
-<div class=s><span class=l>Highscores op het bord</span><span class=n>${fmt(named.length)}</span></div>
-<div class=s><span class=l>Afstand — alle highscores samen</span><span class=n>${fmt(lbTotal)} m</span></div></div>
-<div class="c raw"><h2>⚠️ Ruw — onbeveiligd (mogelijk vervalst)</h2><p class=sub>Rechtstreeks gemelde cijfers zonder controle — alleen ter vergelijking.</p>
+<div class="c"><h2>🚜 Community — alle runs</h2><p class=sub>Alle gespeelde runs sinds de start (ongefilterd geteld).</p>
 <div class=s><span class=l>Keren gespeeld</span><span class=n>${fmt(stats.plays)}</span></div>
-<div class=s><span class=l>Verste afstand</span><span class=n>${fmt(stats.bestDistance)} m</span></div>
 <div class=s><span class=l>Langste stoet</span><span class=n>${fmt(stats.longestConvoy)} 🚜</span></div>
-<div class=s><span class=l>Totale afstand</span><span class=n>${fmt(stats.totalDistance||0)} m</span></div>
 <div class=s><span class=l>Tractoren totaal</span><span class=n>${fmt(stats.totalTractors)}</span></div></div>
+<div class="c rec"><h2>🏁 Highscore-records</h2><p class=sub>Uit het bord — bevestigde inzendingen.</p>
+<div class=s><span class=l>Beste afstand</span><span class=n>${fmt(lbBest)} m</span></div>
+<div class=s><span class=l>Afstand — alle records samen</span><span class=n>${fmt(lbTotal)} m</span></div>
+<div class=s><span class=l>Trekkers — alle records samen</span><span class=n>${fmt(lbTrek)}</span></div>
+<div class=s><span class=l>Aantal highscores</span><span class=n>${fmt(named.length)}</span></div></div>
+<div class="c val"><h2>✅ Gevalideerd — sinds ${sinceStr}</h2><p class=sub>Runs die de anti-cheat doorstaan; groeit vanaf het inschakelen van de beveiliging.</p>
+<div class=s><span class=l>Gevalideerde runs</span><span class=n>${fmt(v.plays)}</span></div>
+<div class=s><span class=l>Afstand — iedereen samen</span><span class=n>${fmt(v.totalDistance)} m</span></div>
+<div class=s><span class=l>Tractoren</span><span class=n>${fmt(v.totalTractors)}</span></div>
+<div class=s><span class=l>Verste afstand (bevestigd)</span><span class=n>${fmt(record)} m</span></div></div>
 <p style="text-align:center"><small>Laatst bijgewerkt: ${stats.updated || '—'}</small></p></html>`;
     return send(res,200,'text/html; charset=utf-8', html, origin);
   }
