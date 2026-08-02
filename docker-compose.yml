@@ -6,10 +6,10 @@ services:
     environment:
       - PORT=3000
       - DATA_DIR=/data
-      # Losse, verplichte secrets. Zet ze in Coolify als eigen env-vars (sterke willekeurige waarden).
-      # De server WEIGERT te starten als een van deze ontbreekt of een placeholder is.
-      - STATS_KEY=${STATS_KEY:?set-a-strong-random-STATS_KEY}       # beschermt de /stats-pagina
-      - SIGN_SECRET=${SIGN_SECRET:?set-a-strong-random-SIGN_SECRET} # ondertekent de run-tokens
+      # Optionele secrets. Zet ze desgewenst in Coolify als eigen env-vars (sterke willekeurige waarden).
+      # Zo niet, dan genereert de server zelf een sterk secret en bewaart dat in /data (nooit uit de repo).
+      - STATS_KEY=${STATS_KEY:-}        # beschermt de /stats-pagina (leeg = /stats blijft dicht)
+      - SIGN_SECRET=${SIGN_SECRET:-}    # ondertekent de run-tokens (leeg = auto-gegenereerd + bewaard)
       - ALLOW_ORIGIN=${ALLOW_ORIGIN:-https://totrit.inboekel.nl}    # CORS: alleen de eigen origin
     volumes:
       - traktor-stats:/data  # bewaart de statistieken + scores tussen deploys

@@ -21,18 +21,28 @@ const STATS_FILE = path.join(DATA_DIR, 'stats.json');
 const SCORES_FILE= path.join(DATA_DIR, 'scores.json');
 const GAME_FILE  = path.join(__dirname, 'traktor-racer.html');
 
-// --- required secrets: no repo defaults; refuse to start on a missing/placeholder value ---
-function requireSecret(name){
+// --- secrets: NEVER a public/repo default. Use a strong env var if given; otherwise generate a
+// strong random secret once and persist it in the /data volume (not in the repo). Fail-safe: the
+// server always starts, but it can never fall back to a value that is knowable from the source code. ---
+try { fs.mkdirSync(DATA_DIR, { recursive:true }); } catch(e){}
+function validEnv(name){
   const v = process.env[name];
   const placeholder = /^(changeme|change-me|change_me|placeholder|secret|password|example|test|GCMumtU50oNOrqTpLig2)$/i;
-  if(!v || v.length < 16 || placeholder.test(v)){
-    console.error('FATAL: env var ' + name + ' is missing or a placeholder. Set a strong random value (>=16 chars) in Coolify before deploying.');
-    process.exit(1);
-  }
+  return (v && v.length >= 16 && !placeholder.test(v)) ? v : null;
+}
+function persistentSecret(fileName){
+  const p = path.join(DATA_DIR, fileName);
+  try { const v = String(fs.readFileSync(p,'utf8')).trim(); if(v && v.length >= 16) return v; } catch(e){}
+  const v = crypto.randomBytes(24).toString('base64url');
+  try { fs.writeFileSync(p, v, { mode:0o600 }); } catch(e){}
   return v;
 }
-const STATS_KEY   = requireSecret('STATS_KEY');    // protects the private /stats page
-const SIGN_SECRET = requireSecret('SIGN_SECRET');  // signs the run start-tokens (server-only)
+// signs the run start-tokens; nobody needs to know it -> env if set, else auto-generated + persisted
+const SIGN_SECRET = validEnv('SIGN_SECRET') || persistentSecret('.sign_secret');
+// protects the private /stats page; the owner needs to know it -> env if set, else a persisted random key
+const STATS_KEY   = validEnv('STATS_KEY')   || persistentSecret('.stats_key');
+if(!validEnv('SIGN_SECRET')) console.warn('note: SIGN_SECRET not set via env; using the persisted key in ' + DATA_DIR + '/.sign_secret');
+if(!validEnv('STATS_KEY'))   console.warn('note: STATS_KEY not set via env; /stats uses a persisted random key until you set STATS_KEY.');
 const ALLOW_ORIGIN= process.env.ALLOW_ORIGIN || 'https://totrit.inboekel.nl';
 
 const TOKEN_TTL_MS = 60*60*1000;   // a start-token is valid for 60 minutes
